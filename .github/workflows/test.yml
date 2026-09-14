@@ -1,0 +1,58 @@
+name: Test publish-cocoapod
+on:
+  workflow_dispatch:
+    inputs:
+      spec-repo:
+        description: Specs repo to publish the fixture pod to (owner/name)
+        required: true
+      dry-run:
+        description: Validate only, no PR
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: maxim-lobanov/setup-cocoapods@v1
+        with:
+          version: latest
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # A two-file Objective-C pod that validates in seconds, at a version nobody
+      # has published, built from the commit under test.
+      - name: Write fixture podspec
+        run: |
+          cat > TestPod.podspec << 'SPEC'
+          Pod::Spec.new do |spec|
+            spec.name = "TestPod"
+            spec.version = "0.0.${{ github.run_number }}"
+            spec.summary = "Fixture pod for publish-cocoapod-action."
+            spec.homepage = "https://github.com/${{ github.repository }}"
+            spec.license = {:type => "Apache 2.0", :file => "LICENSE"}
+            spec.author = "LiveKit"
+
+            spec.ios.deployment_target = "13.0"
+            spec.osx.deployment_target = "10.15"
+
+            spec.source = {
+              :git => "${{ github.server_url }}/${{ github.repository }}.git",
+              :commit => "${{ github.sha }}",
+            }
+            spec.source_files = "test/TestPod/*.{h,m}"
+          end
+          SPEC
+          cat TestPod.podspec
+
+      - uses: ./
+        with:
+          podspec: TestPod.podspec
+          spec-repo: ${{ inputs.spec-repo }}
+          dry-run: ${{ inputs.dry-run }}
+          sources: https://cdn.cocoapods.org/
+          token: ${{ secrets.TEST_SPECS_PAT }}

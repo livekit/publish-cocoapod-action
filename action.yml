@@ -1,0 +1,174 @@
+name: Publish Podspec
+description: >
+  Validate a podspec with `pod repo push --local-only` and publish it to a
+  CocoaPods specs repo via PR. Name, version and layout come from CocoaPods.
+
+inputs:
+  podspec:
+    description: Path to the .podspec file
+    required: true
+  token:
+    description: GitHub PAT with repo access to the specs repo
+    required: true
+  spec-repo:
+    description: Specs repo in owner/name format
+    required: false
+    default: 'livekit/podspecs'
+  sources:
+    description: Comma-separated podspec sources used to resolve dependencies while validating
+    required: false
+    default: 'https://github.com/livekit/podspecs.git/,https://cdn.cocoapods.org/'
+  dry-run:
+    description: Validate and commit locally only — no branch pushed, no PR
+    required: false
+    default: 'false'
+  branch-prefix:
+    description: Prefix for the branch name (pod name and version are appended)
+    required: false
+    default: 'publish/'
+  commit-author-name:
+    description: Git author name
+    required: false
+    default: 'github-actions[bot]'
+  commit-author-email:
+    description: Git author email
+    required: false
+    default: '41898282+github-actions[bot]@users.noreply.github.com'
+  pr-body:
+    description: Extra text appended to the PR body
+    required: false
+    default: ''
+
+outputs:
+  name:
+    description: Pod name read from the podspec
+    value: ${{ steps.spec.outputs.name }}
+  version:
+    description: Pod version read from the podspec
+    value: ${{ steps.spec.outputs.version }}
+  branch:
+    description: Created branch name
+    value: ${{ steps.spec.outputs.branch }}
+  pr-number:
+    description: PR number
+    value: ${{ steps.pr.outputs.pr-number }}
+  pr-url:
+    description: PR URL
+    value: ${{ steps.pr.outputs.pr-url }}
+
+runs:
+  using: composite
+  steps:
+    # Step 1: Read the podspec. `pod ipc spec` evaluates the Ruby, so a computed
+    # version resolves the same way CocoaPods sees it. Only used for naming the
+    # branch — the path inside the specs repo is CocoaPods' business.
+    - name: Read podspec
+      id: spec
+      shell: bash
+      run: |
+        set -euo pipefail
+        PODSPEC="${{ inputs.podspec }}"
+        PODSPEC="$(cd "$(dirname "${PODSPEC}")" && pwd)/$(basename "${PODSPEC}")"
+        JSON=$(pod ipc spec "${PODSPEC}")
+        NAME=$(echo "${JSON}" | jq -er '.name')
+        VERSION=$(echo "${JSON}" | jq -er '.version')
+        {
+          echo "podspec=${PODSPEC}"
+          echo "name=${NAME}"
+          echo "version=${VERSION}"
+          echo "branch=${{ inputs.branch-prefix }}${NAME}-${VERSION}"
+          echo "repo-dir=${CP_HOME_DIR:-${HOME}/.cocoapods}/repos/publish-target"
+        } >> "$GITHUB_OUTPUT"
+        echo "${NAME} ${VERSION}"
+
+    # Step 2: Clone the specs repo into CocoaPods' repo directory, where
+    # `pod repo push` expects it.
+    - name: Add specs repo
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+      run: |
+        # pod echoes the clone URL, so the token has to be masked first.
+        echo "::add-mask::${TOKEN}"
+        pod repo remove publish-target >/dev/null 2>&1 || true
+        pod repo add publish-target \
+          "https://x-access-token:${TOKEN}@github.com/${{ inputs.spec-repo }}.git"
+
+    - name: Configure git
+      shell: bash
+      working-directory: ${{ steps.spec.outputs.repo-dir }}
+      run: |
+        set -euo pipefail
+        git config user.name "${{ inputs.commit-author-name }}"
+        git config user.email "${{ inputs.commit-author-email }}"
+
+        DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+        echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> "$GITHUB_ENV"
+
+        BRANCH="${{ steps.spec.outputs.branch }}"
+        # Delete remote branch if it exists (idempotency for retries)
+        if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+          echo "Branch ${BRANCH} already exists on remote, deleting for retry..."
+          git push origin --delete "${BRANCH}"
+        fi
+
+    # Step 3: Validate, file under Specs/<name>/<version>/ and commit — all of it
+    # CocoaPods' own logic, so the result matches a hand-run `pod repo push`.
+    # --no-overwrite keeps a published version immutable.
+    - name: Push podspec to local specs repo
+      shell: bash
+      run: |
+        pod repo push publish-target "${{ steps.spec.outputs.podspec }}" \
+          --local-only \
+          --no-overwrite \
+          --allow-warnings \
+          --verbose \
+          --sources="${{ inputs.sources }}"
+
+    # The branch is cut after the commit because `pod repo push` pulls the repo
+    # first, and a fresh branch has no upstream to pull from.
+    - name: Push branch
+      if: ${{ inputs.dry-run != 'true' }}
+      shell: bash
+      working-directory: ${{ steps.spec.outputs.repo-dir }}
+      run: |
+        BRANCH="${{ steps.spec.outputs.branch }}"
+        git checkout -b "${BRANCH}"
+        git push -u origin "${BRANCH}"
+
+    - name: Open PR
+      id: pr
+      if: ${{ inputs.dry-run != 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        EXTRA_BODY: ${{ inputs.pr-body }}
+      run: |
+        set -euo pipefail
+        REPO="${{ inputs.spec-repo }}"
+        BRANCH="${{ steps.spec.outputs.branch }}"
+
+        # github.repository is the calling workflow's repo, not this action's.
+        SOURCE_REPO="${{ github.repository }}"
+        SHA="${{ github.sha }}"
+        BODY="Built by [\`${SOURCE_REPO}@${SHA:0:7}\`](${{ github.server_url }}/${SOURCE_REPO}/commit/${SHA})"
+        if [ -n "${EXTRA_BODY}" ]; then
+          BODY="${BODY}
+
+        ${EXTRA_BODY}"
+        fi
+
+        # Title matches CocoaPods' own commit message, e.g. "[Update] Pod (1.2.3)".
+        TITLE=$(git -C "${{ steps.spec.outputs.repo-dir }}" log -1 --pretty=%s)
+
+        PR_URL=$(gh pr create \
+          --repo "${REPO}" \
+          --base "${DEFAULT_BRANCH}" \
+          --head "${BRANCH}" \
+          --title "${TITLE}" \
+          --body "${BODY}")
+
+        PR_NUMBER=$(gh pr view "${BRANCH}" --repo "${REPO}" --json number --jq '.number')
+        echo "pr-number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+        echo "pr-url=${PR_URL}" >> "$GITHUB_OUTPUT"
+        echo "PR: ${PR_URL}"
